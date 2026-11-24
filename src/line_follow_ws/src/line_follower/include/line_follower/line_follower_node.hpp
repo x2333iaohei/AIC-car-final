@@ -7,7 +7,6 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <image_transport/image_transport.hpp>
-#include <nav_msgs/msg/odometry.hpp>
 #include <opencv2/core.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -37,9 +36,15 @@ struct ProcessingResult
 
   cv::Mat roi_bgr;
   cv::Mat binary_mask;
+  cv::Mat yellow_mask;
 
   int roi_top{0};
   int roi_bottom{0};
+
+  // T-junction (`┤`) geometry diagnostics computed on bottom-seeded connected road
+  bool tjunction_candidate{false};
+  double upper_road_ratio{1.0};
+  int tjunction_full_rows{0};
 };
 
 class LineFollowerNode : public rclcpp::Node
@@ -52,8 +57,7 @@ private:
   void setup_interfaces();
 
   void start_callback(const std_msgs::msg::Bool::SharedPtr msg);
-  void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
-  void reverse_brake_timer_callback();
+  void detection_cmd_callback(const geometry_msgs::msg::Twist::SharedPtr msg);
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & msg);
 
   std::optional<ProcessingResult> process_image(const cv::Mat & frame_bgr) const;
@@ -62,6 +66,7 @@ private:
     const cv::Mat & frame_bgr,
     int roi_top,
     int roi_bottom,
+    const cv::Mat & road_mask,
     const cv::Point2d & line_centroid_roi,
     double & side_sign,
     cv::Point2d & red_centroid_img,
@@ -73,7 +78,8 @@ private:
   void publish_cmd_vel(
     double linear_speed,
     double yaw_rate,
-    bool publish_stop);
+    bool publish_stop,
+    bool publish_avoid = false);
 
   void publish_state(TrackState state);
   void publish_centroid(double norm_x, double norm_y);
@@ -90,6 +96,8 @@ private:
   // ============================================================
   std::string image_topic_;
   std::string cmd_vel_topic_;
+  std::string avoid_cmd_topic_;
+  std::string detection_cmd_topic_;
   std::string debug_image_topic_;
   std::string line_state_topic_;
   std::string start_topic_;
@@ -97,13 +105,19 @@ private:
   std::string line_centroid_topic_;
 
   // ============================================================
-  // Basic motion
+  // Basic motion & PD control
   // ============================================================
   double target_speed_{0.6};
   double max_speed_{1.0};
   double min_speed_{0.0};
   double max_yaw_rate_{1.2};
   double kp_{1.8};
+  double kd_{0.0};
+
+  bool has_prev_error_{false};
+  double prev_error_{0.0};
+  double filtered_deriv_{0.0};
+  rclcpp::Time last_error_time_;
 
   // ============================================================
   // ROI / image processing
@@ -141,21 +155,6 @@ private:
   double yellow_stop_duration_{1.0};
   int yellow_permanent_count_{5};
 
-  // 可选反向辅助制动；默认关闭。反向速度使用负值，脉冲由新鲜 Odom 截止。
-  bool reverse_brake_enabled_{false};
-  std::string odom_topic_{"/odom"};
-  double reverse_speed_{0.0};
-  double reverse_max_duration_{0.0};
-  double reverse_cutoff_speed_{0.10};
-  double reverse_abort_speed_{0.01};
-  double reverse_odom_timeout_{0.15};
-  bool reverse_brake_active_{false};
-  bool odom_received_{false};
-  double odom_linear_speed_{0.0};
-  rclcpp::Time odom_receive_time_;
-  rclcpp::Time reverse_brake_start_time_;
-
-  // 新增：同一条实体黄线只计数一次
   bool yellow_line_latched_{false};
   int yellow_clear_frames_{0};
   int yellow_clear_frames_required_{10};
@@ -166,7 +165,7 @@ private:
   rclcpp::Time yellow_line_detection_time_;
 
   // ============================================================
-  // Intersection probe
+  // Legacy intersection probe (kept for backward compatibility)
   // ============================================================
   bool enable_intersection_probe_{false};
   int intersection_band_height_{50};
@@ -179,6 +178,15 @@ private:
   bool intersection_active_{false};
   rclcpp::Time intersection_end_time_;
   rclcpp::Time intersection_cooldown_until_;
+
+  // ============================================================
+  // DAG T-junction (`┤`) closed-loop merge state
+  // ============================================================
+  bool tjunction_branch_decided_{false};
+  bool tjunction_merge_armed_{false};
+  int tjunction_confirm_count_{0};
+  bool tjunction_merging_{false};
+  rclcpp::Time tjunction_merge_start_time_;
 
   // ============================================================
   // Red obstacle avoidance
@@ -216,11 +224,6 @@ private:
   double speed_gain_damping_{0.5};
   bool publish_debug_image_{true};
 
-  // Only used by the opt-in fork-map curve-preview experiment.
-  bool curve_preview_yaw_initialized_{false};
-  double curve_preview_last_yaw_rate_{0.0};
-  rclcpp::Time curve_preview_last_time_;
-
   bool start_enabled_{false};
   TrackState last_state_{TrackState::LOST};
   rclcpp::Time last_detection_time_;
@@ -229,14 +232,14 @@ private:
   // ROS interfaces
   // ============================================================
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr avoid_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr stop_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr centroid_pub_;
 
   image_transport::Subscriber image_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr start_sub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  rclcpp::TimerBase::SharedPtr reverse_brake_timer_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr detection_cmd_sub_;
 
   image_transport::Publisher debug_pub_;
   bool debug_enabled_{false};

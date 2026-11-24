@@ -97,7 +97,11 @@ def make_bag(parent, storage):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--directory", type=Path, required=True)
+    parser.add_argument(
+        "--directory",
+        type=Path,
+        default=Path(__file__).resolve().parent / "output" / "synthetic_demo",
+    )
     parser.add_argument("--storage", choices=("sqlite3", "mcap"), default="sqlite3")
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)

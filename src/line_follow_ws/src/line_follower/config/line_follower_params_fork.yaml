@@ -1,0 +1,199 @@
+# ============================================================================
+# 全国总决赛 —— 岔路地图（Fork Map）专属参数配置
+# 对应实测参考包：fork_06 / fork_11 / fork_12 / fork_13
+# 设计准则：
+#   1. 完整保留已实车验证稳定的白路提取、黄线检测与停车参数（两条支路均为 4 条黄线）；
+#   2. 针对内侧捷径支路末端垂直汇入主干道的 `┤` 丁字路口（fork_06/11/12 出现 near=0, far=0 对称死锁处），
+#      采用“底部连通道路水平墙 + 全宽双向横贯行检测 + DAG 拓扑分支门控 + 视觉闭环退出”（enable_tjunction_merge），
+#      8 个实测包 8,481 帧验证 3/3 提前 ~55cm 检出、单行道 90° 弯与 S 弯 0 误判，严格按顺行方向（右转）并线；
+#   3. 单行道 90° 折弯与紧凑 S 弯（fork_13）依靠动态远端预瞄（curve_preview）+ PD 微分阻尼平滑通过；
+#   4. 配合 35x13 镂空红色禁行区聚类、四级优先级仲裁与 3帧至少2帧命中的稳健数字对齐。
+# ============================================================================
+
+line_follower_node:
+  ros__parameters:
+    image_topic: "/image_raw"
+    cmd_vel_topic: "/cmd_vel_follower"
+    avoid_cmd_topic: "/cmd_vel_avoid"
+    detection_cmd_topic: "/cmd_vel_detection"
+    debug_image_topic: "line_follower/debug_image"
+    line_state_topic: "line_follower/track_state"
+    start_topic: "line_follower/start_cmd"
+    stop_cmd_topic: "/cmd_vel_stop"
+    line_centroid_topic: "line_follower/centroid"
+
+    # ================================
+    # 基础速度与 PD 转向控制
+    # ================================
+    target_speed: 0.30
+    max_speed: 0.40
+    min_speed: 0.0
+    max_yaw_rate: 1.60
+    kp: 2.50
+    kd: 0.32
+
+    # ================================
+    # 图像预处理与白路提取（保持实车验证值不变）
+    # ================================
+    roi_top_ratio: 0.65
+    roi_bottom_ratio: 0.20
+    gaussian_kernel: 5
+    binary_threshold: 160.0
+    morph_kernel: 3
+    morph_iterations: 2
+    min_contour_area: 2500.0
+    invert_binary: false
+
+    use_white_filter: true
+    white_h_low: 0
+    white_h_high: 180
+    white_s_max: 45
+    white_v_min: 80
+
+    # ================================
+    # 黄色停车线（两条支路汇合后均经过第 3、4 条黄线，保持不变）
+    # ================================
+    use_yellow_filter: true
+    yellow_h_low: 20
+    yellow_h_high: 40
+    yellow_s_min: 80
+    yellow_v_min: 120
+    yellow_area_ratio_threshold: 0.02
+    yellow_stop_duration: 1.0
+    yellow_permanent_count: 4
+    yellow_clear_frames: 10
+
+    # ================================
+    # 岔路地图弯道预瞄 + 丁字汇合口（┤）DAG 顺行闭环并线
+    # ================================
+    enable_intersection_probe: false
+    intersection_band_height: 50
+    intersection_dark_ratio_threshold: 1.0
+    intersection_turn_speed: 0.20
+    intersection_turn_yaw_rate: 1.8
+    intersection_turn_duration: 2.0
+    intersection_cooldown: 2.0
+
+    enable_continuous_curve_assist: true
+    reverse_curve_min_error: 0.10
+    reverse_curve_threshold: 0.30
+    reverse_curve_confirm_frames: 2
+    reverse_curve_clear_frames: 4
+    reverse_curve_speed: 0.17
+
+    sharp_curve_threshold: 0.38
+    sharp_curve_speed: 0.17
+
+    # 单行道急弯动态远端预瞄：同向远端大曲率时平滑将 far 权重从 0.30 提升至 0.50
+    enable_curve_preview_steering: true
+    curve_preview_max_far_weight: 0.50
+
+    # 内侧捷径支路末端 `┤` 丁字汇合口顺行闭环并线：
+    enable_tjunction_merge: true
+    tjunction_require_branch_gate: true
+    tjunction_branch_yellow_count: 2
+    tjunction_branch_trigger_sign: -1
+    tjunction_merge_direction: -1
+    tjunction_confirm_frames: 3
+    tjunction_wall_min_y_ratio: 0.23
+    tjunction_wall_max_y_ratio: 0.62
+    tjunction_wall_max_spread_ratio: 0.10
+    tjunction_min_full_rows: 55
+    tjunction_merge_speed: 0.16
+    tjunction_merge_yaw_rate: 1.20
+    tjunction_min_turn_duration: 0.35
+    tjunction_max_turn_duration: 1.15
+    tjunction_exit_upper_road_ratio: 0.12
+
+    # ================================
+    # 红色目标（实心红锥 + 汇合口下游镂空红色禁行区聚类）
+    # ================================
+    enable_red_filter: true
+    red_h_low_1: 0
+    red_h_high_1: 10
+    red_h_low_2: 160
+    red_h_high_2: 180
+    red_s_min: 90
+    red_v_min: 70
+
+    red_area_ratio_threshold: 0.0035
+    red_divider_angle_deg: 8.0
+    red_vote_frames: 3
+
+    red_turn_yaw: 0.40
+    red_turn_linear: 0.30
+    red_turn_duration: 0.20
+
+    # 横向红线 & 红色禁行区（35x13 多竖纹闭运算聚类 + 真实白路空间选侧）
+    red_line_aspect_ratio_min: 3.0
+    red_line_min_width_ratio: 0.30
+    enable_red_zone_cluster: true
+    red_zone_close_kernel_w: 35
+    red_zone_close_kernel_h: 13
+    red_zone_min_width_ratio: 0.11
+    red_zone_min_area_ratio: 0.0030
+    red_zone_max_fill_ratio: 0.30
+    red_zone_near_ratio: 0.28
+    red_line_fallback_direction: -1
+    # 配合 (1 + 1.55*risk) 动态放大，0.28 对应 -0.28 ~ -0.71 rad/s 柔和变道，既避开红框又不压右侧黑边
+    red_line_soft_yaw: 0.28
+    red_line_speed: 0.17
+
+    # 实心红锥轮廓阈值（保持原版不变）
+    red_cone_area_ratio_threshold: 0.0006
+    red_cone_min_bbox_width: 4
+    red_cone_min_bbox_height: 4
+
+    # 动态软避障与高风险 mux 抢占
+    enable_soft_red_avoidance: true
+    red_soft_yaw: 0.16
+    red_repulsion_gain: 1.55
+    red_near_ratio: 0.36
+    red_very_close_ratio: 0.72
+    red_corridor_half_width_ratio: 0.35
+    red_soft_curve_yaw_limit: 0.18
+    red_lane_keep_min_factor: 0.42
+    red_soft_speed: 0.23
+    red_min_forward_speed: 0.15
+    red_mux_preempt_risk: 0.30
+
+    line_lost_stop_time: 0.8
+    line_lost_forward_speed: 0.20
+    line_lost_yaw_hold_factor: 0.90
+    speed_gain_damping: 0.65
+    publish_debug_image: true
+
+detection_turn_controller:
+  ros__parameters:
+    detection_topic: "hobot_dnn_detection"
+    state_topic: "line_follower/track_state"
+    start_topic: "line_follower/start_cmd"
+    cmd_vel_topic: "/cmd_vel_detection"
+    det_frame_width: 640
+    det_frame_height: 480
+    # 0.35 滤除低置信噪点，保持原实车 8/8 全命中的 y=centroid_y±0.012 对齐线（防止弯道外侧数字 2 提前抢触发漏掉数字 4）
+    confidence_threshold: 0.35
+    frame_window: 2
+    min_candidate_frames: 1
+    turn_cooldown: 1.0
+    # 岔路口右支路（如 2v4）切入角度较大，消除 launch 0.5s 拖尾后显式设为 0.52s
+    turn_duration: 0.52
+    turn_linear: 0.20
+    yaw_gain: 1.75
+    max_yaw_rate: 1.15
+    turn_direction_sign: -1.0
+    target_y_offset: 0.0
+    y_align_tolerance: 0.012
+    line_centroid_topic: "line_follower/centroid"
+    centroid_timeout: 0.30
+
+cmd_mux_node:
+  ros__parameters:
+    stop_topic: "/cmd_vel_stop"
+    stop_timeout: 0.50
+    avoid_topic: "/cmd_vel_avoid"
+    avoid_timeout: 0.12
+    high_topic: "/cmd_vel_detection"
+    high_timeout: 0.12
+    low_topic: "/cmd_vel_follower"
+    output_topic: "/cmd_vel"

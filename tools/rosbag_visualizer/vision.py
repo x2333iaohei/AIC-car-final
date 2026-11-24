@@ -10,7 +10,7 @@ import numpy as np
 from params import clamp
 
 
-def band_center(binary, y0, y1, reference):
+def band_run(binary, y0, y1, reference):
     y0 = clamp(y0, 0, binary.shape[0] - 1)
     y1 = clamp(y1, y0 + 1, binary.shape[0])
     band = binary[y0:y1]
@@ -26,8 +26,12 @@ def band_center(binary, y0, y1, reference):
         distance = 0. if low <= reference <= high else abs(candidate - reference)
         if (distance < best_distance or
                 (abs(distance - best_distance) < 1e-6 and width > best_width)):
-            center, best_distance, best_width = float(candidate), distance, width
-    return center
+            center, best_distance, best_width = float(candidate), distance, int(width)
+    return center, best_width
+
+
+def band_center(binary, y0, y1, reference):
+    return band_run(binary, y0, y1, reference)[0]
 
 
 def external_contours(mask):
@@ -90,6 +94,9 @@ class Frame:
     far_weight: Optional[float]
     error: Optional[float]
     red: Red
+    tjunction_candidate: bool = False
+    upper_road_ratio: float = 1.0
+    tjunction_full_rows: int = 0
 
 
 class RedHistory:
@@ -129,7 +136,10 @@ class RedHistory:
         length = math.hypot(dx, dy)
         lateral = abs(dx*ry-dy*rx)/length if length > 1e-6 else 1e9
         red.in_corridor = lateral <= clamp(p["red_corridor_half_width_ratio"], 0., 1.)*w
-        near = clamp(p["red_near_ratio"], 0., 1.)
+        near = clamp(
+            p.get("red_zone_near_ratio", p["red_near_ratio"]) if red.kind == "line" else p["red_near_ratio"],
+            0., 1.,
+        )
         very_close = clamp(p["red_very_close_ratio"], 0., 1.)
         if (not yellow_stop and confirmed and red.bottom_ratio >= near and
                 (red.in_corridor or red.bottom_ratio >= very_close)):
@@ -143,6 +153,9 @@ class Vision:
         size = params["morph_kernel"]
         self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (size, size))
         self.red_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        kw = max(5, int(params.get("red_zone_close_kernel_w", 35)))
+        kh = max(3, int(params.get("red_zone_close_kernel_h", 13)))
+        self.zone_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
         self.gaussian_size = params["gaussian_kernel"]
         self.gaussian_kernel = cv2.getGaussianKernel(self.gaussian_size, 0, cv2.CV_32F)
         self.reset()
@@ -175,7 +188,7 @@ class Vision:
                 self.clear = 0
         return n, f, candidate
 
-    def _target(self, near, far, near_band, far_band, n, f, candidate, fallback):
+    def _target(self, near, far, near_w, far_w, width, near_band, far_band, n, f, candidate, fallback):
         ny, fy = sum(near_band)*.5, sum(far_band)*.5
         if near is None and far is None:
             return fallback, "contour" if fallback else "none", None
@@ -187,7 +200,6 @@ class Vision:
         p = self.p
         weight = .30
         if self.reverse:
-            # With preview enabled, a still-latched S state only overrides opposing errors.
             if not p["enable_curve_preview_steering"] or n*f < 0.:
                 return (near, ny), "near_reverse_curve", 0.
         if p["enable_curve_preview_steering"]:
@@ -198,9 +210,65 @@ class Vision:
                     weight *= 1. - clamp(self.confirm / p["reverse_curve_confirm_frames"], 0., 1.)
             else:
                 weight += (cap - .30) * clamp(max(0., abs(f) - abs(n)) / .20, 0., 1.)
-        return ((1.-weight)*near + weight*far, (1.-weight)*ny + weight*fy), "dual", weight
+                if near_w >= int(.90 * width) and far_w < int(.80 * width):
+                    weight = max(weight, cap)
+        return ((1.-weight)*near + weight*far, .70*ny + .30*fy), "dual", weight
 
-    def _red(self, roi, target, started):
+    def _tjunction(self, closed, yellow, yellow_detected):
+        p = self.p
+        h, w = closed.shape
+        if not p.get("enable_tjunction_merge", False) or h < 40 or w < 100:
+            return False, 1.0, 0
+        bridged = cv2.bitwise_or(closed, yellow) if yellow is not None else closed
+        _, labels = cv2.connectedComponents(bridged, connectivity=8)
+        sy0 = clamp(int(h * .78), 0, h - 1)
+        sx0 = clamp(int(w * .15), 0, w - 1)
+        sx1 = clamp(int(w * .85), sx0 + 1, w)
+        seed_labels = set(np.unique(labels[sy0:, sx0:sx1])) - {0}
+        if not seed_labels:
+            return False, 0.0, 0
+        keep = np.isin(labels, list(seed_labels))
+        road = np.where(keep & (closed > 0), np.uint8(255), np.uint8(0))
+
+        up_h = max(1, int(h * .35))
+        up_patch = road[:up_h, sx0:sx1]
+        upper_ratio = cv2.countNonZero(up_patch) / float(max(1, up_patch.size))
+        if yellow_detected:
+            return False, upper_ratio, 0
+
+        slices = ((20, 120), (140, 240), (270, 370), (400, 500), (520, 620))
+        y_tops = []
+        for s0, s1 in slices:
+            x0 = clamp(int(round(s0 * w / 640.)), 0, w - 2)
+            x1 = clamp(int(round(s1 * w / 640.)), x0 + 1, w)
+            min_w = max(5, int((x1 - x0) * .50))
+            idx = np.where(np.count_nonzero(road[:, x0:x1], axis=1) >= min_w)[0]
+            if len(idx) == 0:
+                return False, upper_ratio, 0
+            y_tops.append(int(idx[0]))
+
+        min_yt, max_yt = min(y_tops), max(y_tops)
+        spread = max_yt - min_yt
+        y_start = min(h - 1, max_yt + 4)
+        y_end = clamp(int(h * .94), y_start + 1, h)
+        sub = road[y_start:y_end, :]
+        edge_w = max(4, int(round(24. * w / 640.)))
+        edge_min = max(3, int(round(18. * w / 640.)))
+        rw = np.count_nonzero(sub, axis=1)
+        lok = np.count_nonzero(sub[:, :edge_w], axis=1) >= edge_min
+        rok = np.count_nonzero(sub[:, w - edge_w:], axis=1) >= edge_min
+        full_rows = int(np.sum((rw >= int(round(.94 * w))) & lok & rok))
+
+        cand = (
+            min_yt >= int(p.get("tjunction_wall_min_y_ratio", .23) * h)
+            and max_yt <= int(p.get("tjunction_wall_max_y_ratio", .62) * h)
+            and spread <= int(p.get("tjunction_wall_max_spread_ratio", .10) * h)
+            and (y_end - y_start) >= 45
+            and full_rows >= int(p.get("tjunction_min_full_rows", 55))
+        )
+        return cand, upper_ratio, full_rows
+
+    def _red(self, roi, road_mask, target, started):
         p = self.p
         if not p["enable_red_filter"]:
             return Red(status="disabled by YAML")
@@ -232,7 +300,66 @@ class Vision:
                   area / area_total >= max(0., p["red_cone_area_ratio_threshold"])):
                 if cone is None or area > cone[0]:
                     cone = (area, box)
-        selected = cone or line
+
+        if p.get("enable_red_zone_cluster", False) and road_mask is not None:
+            zs = min(70, p["red_s_min"])
+            zv = min(60, p["red_v_min"])
+            zm1 = cv2.inRange(hsv, (0, zs, zv), (12, 255, 255))
+            zm2 = cv2.inRange(hsv, (158, zs, zv), (180, 255, 255))
+            raw_zone = cv2.bitwise_or(zm1, zm2)
+            num_l, labels, stats, _ = cv2.connectedComponentsWithStats(raw_zone, connectivity=8)
+            stripe_boxes = []
+            clean_raw = np.zeros_like(raw_zone)
+            for idx in range(1, num_l):
+                if stats[idx, cv2.CC_STAT_AREA] >= 6:
+                    clean_raw[labels == idx] = 255
+                    stripe_boxes.append((
+                        int(stats[idx, cv2.CC_STAT_LEFT]),
+                        int(stats[idx, cv2.CC_STAT_TOP]),
+                        int(stats[idx, cv2.CC_STAT_WIDTH]),
+                        int(stats[idx, cv2.CC_STAT_HEIGHT]),
+                    ))
+            if len(stripe_boxes) >= 2:
+                clustered = cv2.morphologyEx(clean_raw, cv2.MORPH_CLOSE, self.zone_kernel)
+                min_wr = clamp(p.get("red_zone_min_width_ratio", .11), .05, .90)
+                min_ar = max(.0005, p.get("red_zone_min_area_ratio", .0030))
+                max_fr = clamp(p.get("red_zone_max_fill_ratio", .30), .08, .60)
+                for zc in external_contours(clustered):
+                    zx, zy, zw, zh = cv2.boundingRect(zc)
+                    if zw < int(width * min_wr) or zh < 18 or (zw / float(zh)) < 1.30:
+                        continue
+                    b_area = float(zw * zh)
+                    if (b_area / area_total) < min_ar:
+                        continue
+                    raw_fill = cv2.countNonZero(clean_raw[zy:zy+zh, zx:zx+zw]) / max(1., b_area)
+                    if not (.025 <= raw_fill <= max_fr):
+                        continue
+                    n_in = sum(
+                        1 for sx, sy, sw, sh in stripe_boxes
+                        if sx >= zx - 2 and sy >= zy - 2 and sx + sw <= zx + zw + 2 and sy + sh <= zy + zh + 2
+                    )
+                    if n_in < 2:
+                        continue
+                    px0, py0 = max(0, zx - 12), max(0, zy - 8)
+                    px1, py1 = min(width, zx + zw + 12), min(height, zy + zh + 8)
+                    patch = road_mask[py0:py1, px0:px1]
+                    if patch.size > 0 and (cv2.countNonZero(patch) / float(patch.size)) < .50:
+                        continue
+                    if line is None or b_area > line[0]:
+                        line = (b_area, (zx, zy, zw, zh))
+                if line is not None and cone is not None:
+                    lx, ly, lw, lh = line[1]
+                    cx, cy, cw, ch = cone[1]
+                    if cx >= lx - 6 and cy >= ly - 6 and cx + cw <= lx + lw + 6 and cy + ch <= ly + lh + 6:
+                        cone = None
+
+        if line is not None and cone is not None:
+            cone_bot = cone[1][1] + cone[1][3]
+            line_bot = line[1][1] + line[1][3]
+            use_line = line_bot >= cone_bot - 15
+        else:
+            use_line = (line is not None) and (cone is None)
+        selected = line if use_line else cone
         if selected is None:
             return Red(mask=mask, status=status)
 
@@ -242,19 +369,34 @@ class Vision:
         bottom = (center[0], y+h)
         base = (width*.5, float(height))
         divider = rotate_divider(target, base, p["red_divider_angle_deg"])
-        if cone:
+        if not use_line:
             cross = ((divider[0] - base[0])*(center[1] - base[1]) -
                      (divider[1] - base[1])*(center[0] - base[0]))
             side = 1 if cross >= 0. else -1
         else:
-            remaining = width - x - w
-            if remaining > x + 10:
-                side = -1
-            elif x > remaining + 10:
-                side = 1
+            if road_mask is not None and p.get("enable_red_zone_cluster", False):
+                by0 = clamp(y - 10, 0, height - 1)
+                by1 = clamp(y + h + 10, by0 + 1, height)
+                bh_band = max(1, by1 - by0)
+                left_space = cv2.countNonZero(road_mask[by0:by1, :x]) / float(bh_band) if x > 0 else 0.
+                rx0 = clamp(x + w, 0, width)
+                right_space = cv2.countNonZero(road_mask[by0:by1, rx0:]) / float(bh_band) if rx0 < width else 0.
+                if right_space > left_space + 12.:
+                    side = -1
+                elif left_space > right_space + 12.:
+                    side = 1
+                else:
+                    side = 1 if p["red_line_fallback_direction"] >= 0 else -1
+                bottom = (float(min(width - 1, x + w) if side < 0 else max(0, x)), float(y + h))
             else:
-                side = 1 if p["red_line_fallback_direction"] >= 0 else -1
-        return Red(mask, "cone" if cone else "line", box, line[1] if line else None,
+                remaining = width - x - w
+                if remaining > x + 10:
+                    side = -1
+                elif x > remaining + 10:
+                    side = 1
+                else:
+                    side = 1 if p["red_line_fallback_direction"] >= 0 else -1
+        return Red(mask, "line" if use_line else "cone", box, line[1] if line else None,
                    center, bottom, side, area/area_total, divider, status)
 
     def process(self, bgr, started):
@@ -270,8 +412,6 @@ class Vision:
         elif g == 1:
             blur = roi.copy()
         else:
-            # A C++ non-isolated submatrix uses the separable Gaussian path
-            # with parent pixels. Python slices alone lose the parent extent.
             pad_top, pad_end = max(0, top - g//2), min(height, bottom + g//2)
             padded = cv2.sepFilter2D(bgr[pad_top:pad_end], -1, self.gaussian_kernel,
                                      self.gaussian_kernel, borderType=cv2.BORDER_DEFAULT)
@@ -312,18 +452,21 @@ class Vision:
         near_band = int(h * .62), int(h * .88)
         far_band = int(h * .34), int(h * .56)
         center = width*.5
-        near = band_center(closed, *near_band, center)
-        far = band_center(closed, *far_band, center if near is None else near)
+        near, near_w = band_run(closed, *near_band, center)
+        far, far_w = band_run(closed, *far_band, center if near is None else near)
         n, f, candidate = self._curve(near, far, center)
-        target, source, weight = self._target(near, far, near_band, far_band, n, f, candidate, fallback)
+        target, source, weight = self._target(
+            near, far, near_w, far_w, width, near_band, far_band, n, f, candidate, fallback
+        )
         error = clamp((target[0] - center)/center, -1., 1.) if target else None
         if target:
             target = tuple(float(np.float32(value)) for value in target)
+        tj_cand, up_ratio, tj_rows = self._tjunction(closed, yellow, detected)
         if started is False:
-            # publish_debug_image sees the cleared curve globals when paused.
             self.reset()
             n, f = 0., 0.
         return Frame(top, bottom, roi, blur, hsv, road, opened, closed, yellow, ratio, detected,
                      contours, box, near_band, far_band, near, far, n, f,
                      max(abs(n), abs(f)), candidate, self.reverse, self.confirm, self.clear,
-                     target, source, weight, error, self._red(roi, target, started))
+                     target, source, weight, error, self._red(roi, closed, target, started),
+                     tj_cand, up_ratio, tj_rows)

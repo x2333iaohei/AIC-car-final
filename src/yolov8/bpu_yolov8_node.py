@@ -88,7 +88,7 @@ class BPUYoloV8DigitNode(Node):
         # =====================================================
         # 2. 类别文件
         # =====================================================
-        cls_list_path = '/home/sunrise/aic_car_final/src/yolov8/mod1/out.list'
+        cls_list_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mod1', 'out.list')
 
         if os.path.exists(cls_list_path):
             with open(cls_list_path, 'r', encoding='utf-8') as f:
@@ -107,7 +107,7 @@ class BPUYoloV8DigitNode(Node):
         # =====================================================
         # 3. 加载 X5 BPU 模型
         # =====================================================
-        model_path = '/home/sunrise/aic_car_final/src/yolov8/mod1/best_modified_yolov8.bin'
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mod1', 'best_modified_yolov8.bin')
 
         if not os.path.exists(model_path):
             self.get_logger().error(f'模型文件不存在: {model_path}')

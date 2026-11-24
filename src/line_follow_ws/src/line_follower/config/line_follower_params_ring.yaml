@@ -1,0 +1,183 @@
+# ============================================================================
+# 全国总决赛 —— 环岛地图（Ring Map）专属参数配置
+# 对应实测参考包：fork_01 / fork_02 / fork_03 / fork_04
+# 设计准则：
+#   1. 完整保留已实车验证稳定的白路提取、黄线检测与停车参数（4 条黄线均稳停不压线）；
+#   2. 消除 launch 硬编码 high_timeout=0.5s 拖尾，用 4 级优先级（stop > avoid > detection > follower）
+#      解决 fork_04 终点前数字 8 转向冲向红锥问题；
+#   3. 针对 24x13cm 镂空红色禁行区（1cm 细框 + 多竖纹），启用 35x13 闭运算聚类与白路空间选侧；
+#   4. 经 8 包实测调优数字对齐带（target_y_offset=-0.02, tol=0.025, conf>=0.55, 3帧窗口至少2帧命中），
+#      避免提前漏掉左侧抗干扰数字 7 或被底部透视畸变伪数字干扰；
+#   5. 环岛地图关闭激进远端预瞄与丁字并线状态机，配合 kd=0.28 平滑绕锥与圆弧过弯。
+# ============================================================================
+
+line_follower_node:
+  ros__parameters:
+    image_topic: "/image_raw"
+    cmd_vel_topic: "/cmd_vel_follower"
+    avoid_cmd_topic: "/cmd_vel_avoid"
+    detection_cmd_topic: "/cmd_vel_detection"
+    debug_image_topic: "line_follower/debug_image"
+    line_state_topic: "line_follower/track_state"
+    start_topic: "line_follower/start_cmd"
+    stop_cmd_topic: "/cmd_vel_stop"
+    line_centroid_topic: "line_follower/centroid"
+
+    # ================================
+    # 基础速度与 PD 转向控制
+    # ================================
+    target_speed: 0.30
+    max_speed: 0.40
+    min_speed: 0.0
+    max_yaw_rate: 1.50
+    kp: 2.45
+    kd: 0.28
+
+    # ================================
+    # 图像预处理与白路提取（保持实车验证值不变）
+    # ================================
+    roi_top_ratio: 0.65
+    roi_bottom_ratio: 0.20
+    gaussian_kernel: 5
+    binary_threshold: 160.0
+    morph_kernel: 3
+    morph_iterations: 2
+    min_contour_area: 2500.0
+    invert_binary: false
+
+    use_white_filter: true
+    white_h_low: 0
+    white_h_high: 180
+    white_s_max: 45
+    white_v_min: 80
+
+    # ================================
+    # 黄色停车线（实车已验证无压线、无溜车，保持不变）
+    # ================================
+    use_yellow_filter: true
+    yellow_h_low: 20
+    yellow_h_high: 40
+    yellow_s_min: 80
+    yellow_v_min: 120
+    yellow_area_ratio_threshold: 0.02
+    yellow_stop_duration: 1.0
+    yellow_permanent_count: 4
+    yellow_clear_frames: 10
+
+    # ================================
+    # 弯道与连续弯控制（环岛以圆弧弯和 180° U 弯为主，关闭远端激进拉扯与丁字并线）
+    # ================================
+    enable_intersection_probe: false
+    intersection_band_height: 50
+    intersection_dark_ratio_threshold: 1.0
+    intersection_turn_speed: 0.20
+    intersection_turn_yaw_rate: 1.8
+    intersection_turn_duration: 2.0
+    intersection_cooldown: 2.0
+
+    enable_continuous_curve_assist: true
+    reverse_curve_min_error: 0.12
+    reverse_curve_threshold: 0.35
+    reverse_curve_confirm_frames: 3
+    reverse_curve_clear_frames: 4
+    reverse_curve_speed: 0.18
+
+    sharp_curve_threshold: 0.48
+    sharp_curve_speed: 0.20
+
+    enable_curve_preview_steering: false
+    curve_preview_max_far_weight: 0.35
+    enable_tjunction_merge: false
+
+    # ================================
+    # 红色目标（实心红锥 + 镂空红色禁行区聚类）
+    # ================================
+    enable_red_filter: true
+    red_h_low_1: 0
+    red_h_high_1: 10
+    red_h_low_2: 160
+    red_h_high_2: 180
+    red_s_min: 90
+    red_v_min: 70
+
+    red_area_ratio_threshold: 0.0035
+    red_divider_angle_deg: 8.0
+    red_vote_frames: 3
+
+    red_turn_yaw: 0.40
+    red_turn_linear: 0.30
+    red_turn_duration: 0.20
+
+    # 横向红线 & 镂空红色禁行区（35x13 闭运算多竖纹聚类 + 真实白路空间选侧）
+    red_line_aspect_ratio_min: 3.0
+    red_line_min_width_ratio: 0.30
+    enable_red_zone_cluster: true
+    red_zone_close_kernel_w: 35
+    red_zone_close_kernel_h: 13
+    red_zone_min_width_ratio: 0.11
+    red_zone_min_area_ratio: 0.0030
+    red_zone_max_fill_ratio: 0.30
+    red_zone_near_ratio: 0.28
+    red_line_fallback_direction: -1
+    # 配合 (1 + 1.55*risk) 动态放大，0.28 对应 -0.28 ~ -0.71 rad/s 柔和变道，既避开红框又不压右侧黑边
+    red_line_soft_yaw: 0.28
+    red_line_speed: 0.17
+
+    # 实心红锥轮廓阈值（保持原版不变）
+    red_cone_area_ratio_threshold: 0.0006
+    red_cone_min_bbox_width: 4
+    red_cone_min_bbox_height: 4
+
+    # 动态软避障与高风险 mux 抢占
+    enable_soft_red_avoidance: true
+    red_soft_yaw: 0.16
+    red_repulsion_gain: 1.55
+    red_near_ratio: 0.38
+    red_very_close_ratio: 0.72
+    red_corridor_half_width_ratio: 0.35
+    red_soft_curve_yaw_limit: 0.16
+    red_lane_keep_min_factor: 0.42
+    red_soft_speed: 0.24
+    red_min_forward_speed: 0.16
+    red_mux_preempt_risk: 0.28
+
+    line_lost_stop_time: 0.8
+    line_lost_forward_speed: 0.20
+    line_lost_yaw_hold_factor: 0.90
+    speed_gain_damping: 0.65
+    publish_debug_image: true
+
+detection_turn_controller:
+  ros__parameters:
+    detection_topic: "hobot_dnn_detection"
+    state_topic: "line_follower/track_state"
+    start_topic: "line_follower/start_cmd"
+    cmd_vel_topic: "/cmd_vel_detection"
+    det_frame_width: 640
+    det_frame_height: 480
+    # 0.35 滤除低置信噪点，同时保留原实车 16/16 全命中的 y=centroid_y±0.012 对齐线（防外侧低分数字提前抢触发）
+    confidence_threshold: 0.35
+    frame_window: 2
+    min_candidate_frames: 1
+    turn_cooldown: 1.0
+    # 消除 launch 0.5s 隐式拖尾后，显式设定环岛分岔/吃分转向时长 0.44s
+    turn_duration: 0.44
+    turn_linear: 0.20
+    yaw_gain: 1.65
+    max_yaw_rate: 1.00
+    turn_direction_sign: -1.0
+    target_y_offset: 0.0
+    y_align_tolerance: 0.012
+    line_centroid_topic: "line_follower/centroid"
+    centroid_timeout: 0.30
+
+cmd_mux_node:
+  ros__parameters:
+    stop_topic: "/cmd_vel_stop"
+    stop_timeout: 0.50
+    avoid_topic: "/cmd_vel_avoid"
+    avoid_timeout: 0.12
+    high_topic: "/cmd_vel_detection"
+    high_timeout: 0.12
+    low_topic: "/cmd_vel_follower"
+    output_topic: "/cmd_vel"

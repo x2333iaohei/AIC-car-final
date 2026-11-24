@@ -84,7 +84,7 @@ def debug_overlay(bgr, result, params, annotations=True):
     return overlay
 
 
-def panels(bgr, result, params):
+def panels(bgr, result, params, recorded_debug=None):
     contours = result.roi.copy()
     if result.contours:
         cv2.drawContours(contours, result.contours, -1, (255, 166, 50), 1)
@@ -104,6 +104,11 @@ def panels(bgr, result, params):
         "Gray threshold (inverted)" if params["invert_binary"] else "Gray threshold")
     yellow_label = ("Yellow mask (disabled)" if result.yellow is None else
                     f"Yellow mask | {result.yellow_ratio:.3%}")
+    overlay_tile = (
+        ("12 Recorded debug_image", recorded_debug, "")
+        if recorded_debug is not None else
+        ("12 Reconstructed overlay", debug_overlay(bgr, result, params, annotations=True), "")
+    )
     return [
         ("01 Original frame", bgr, ""),
         ("02 ROI", result.roi, ""),
@@ -116,7 +121,7 @@ def panels(bgr, result, params):
         ("09 Red mask | raw ROI path", result.red.mask, result.red.status),
         ("10 External contours / boxes", contours, ""),
         ("11 Near / Far / Target", band_image(result), ""),
-        ("12 Reconstructed overlay", debug_overlay(bgr, result, params), ""),
+        overlay_tile,
     ]
 
 
@@ -131,11 +136,11 @@ class Dashboard:
             raise ValueError("Use even MP4 dimensions and a layout with 12–48 usable tiles "
                              "(minimum 112x66 per tile plus 104 px footer).")
 
-    def compose(self, raw, result, params, lines):
+    def compose(self, raw, result, params, lines, recorded_debug=None):
         width, height = self.size
         canvas = np.full((height, width, 3), (21, 19, 17), dtype=np.uint8)
         grid_height = height-self.footer
-        for i, (title, image, missing) in enumerate(panels(raw, result, params)):
+        for i, (title, image, missing) in enumerate(panels(raw, result, params, recorded_debug)):
             row, col = divmod(i, self.cols)
             x, y = width*col//self.cols + 3, grid_height*row//self.rows + 3
             right, bottom = width*(col+1)//self.cols-3, grid_height*(row+1)//self.rows-3
@@ -187,7 +192,7 @@ class FocusDashboard:
             return state.replace("_", " ").capitalize(), "Recorded controller state", False
         return "Road target visible", "Reconstructed from camera", False
 
-    def compose(self, raw, result, params, data, event):
+    def compose(self, raw, result, params, data, event, recorded_debug=None):
         width, height = self.size
         unit = min(width / 1280, height / 800)
         pad = max(8, round(20*unit))
@@ -220,9 +225,15 @@ class FocusDashboard:
             if subtitle:
                 text(canvas, subtitle, x+inset, end_y-inset, end_x-x-2*inset, .56*unit, MUTED)
 
-        card(pad, top, left_end, bottom, "Road and target  /  offline overlay",
-             debug_overlay(raw, result, params, annotations=False),
-             "Red dot: target   |   Yellow line: steering divider")
+        if recorded_debug is not None:
+            main_title = "Road and target  /  recorded debug_image"
+            main_image = recorded_debug
+            main_subtitle = "Recorded /line_follower/debug_image from bag"
+        else:
+            main_title = "Road and target  /  offline overlay (reconstructed)"
+            main_image = debug_overlay(raw, result, params, annotations=True)
+            main_subtitle = "Red dot: target   |   Yellow line: steering divider   |   Full debug overlay"
+        card(pad, top, left_end, bottom, main_title, main_image, main_subtitle)
         card(right_start, top, right_end, middle-gap//2, "Lane sampling",
              band_image(result),
              "Green: Near   Blue: Far" + ("   |   S-turn confirmed" if result.reverse_curve else ""))

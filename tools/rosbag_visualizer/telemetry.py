@@ -153,12 +153,17 @@ def braking(db, trigger_ns, max_gap=.20, dwell=.20, stop_speed=.02,
 
 
 _YELLOW_COUNT = re.compile(r"New yellow line detected! Count: (\d+)/(\d+)")
+_START_CHANGED = re.compile(r"Start signal changed:\s*(true|false)\s*->\s*(true|false)")
 
 
 def log_event(text):
     count = _YELLOW_COUNT.search(text)
     if count:
         return "yellow_trigger", int(count[1]), int(count[2]), text
+    start_match = _START_CHANGED.search(text)
+    if start_match:
+        kind = "start_true" if start_match[2] == "true" else "start_false"
+        return kind, None, None, text
     for prefix, kind in (
         ("Final yellow line detected.", "yellow_permanent"),
         ("Yellow line stop duration ended.", "yellow_resume"),
@@ -167,6 +172,7 @@ def log_event(text):
         ("Reverse brake ended:", "reverse_end"),
         ("Reverse brake skipped:", "reverse_skipped"),
         ("Previous lap finished.", "lap_reset"),
+        ("Line follower is not started", "start_waiting"),
     ):
         if text.startswith(prefix):
             return kind, None, None, text

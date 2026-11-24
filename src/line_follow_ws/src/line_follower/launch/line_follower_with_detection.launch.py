@@ -24,12 +24,17 @@ def generate_launch_description():
     follower_cmd_arg = DeclareLaunchArgument(
         "follower_cmd_topic",
         default_value="/cmd_vel_follower",
-        description="巡线节点输出话题",
+        description="巡线节点输出话题（基础优先级）",
+    )
+    avoid_cmd_arg = DeclareLaunchArgument(
+        "avoid_cmd_topic",
+        default_value="/cmd_vel_avoid",
+        description="近距红色高风险避障输出话题（高于数字转向，低于黄线停车）",
     )
     detection_cmd_arg = DeclareLaunchArgument(
         "detection_cmd_topic",
         default_value="/cmd_vel_detection",
-        description="检测节点输出话题（高优先级）",
+        description="YOLO数字转向输出话题",
     )
     stop_cmd_arg = DeclareLaunchArgument(
         "stop_cmd_topic",
@@ -55,6 +60,7 @@ def generate_launch_description():
     image_topic = LaunchConfiguration("image_topic")
     cmd_vel_topic = LaunchConfiguration("cmd_vel_topic")
     follower_cmd_topic = LaunchConfiguration("follower_cmd_topic")
+    avoid_cmd_topic = LaunchConfiguration("avoid_cmd_topic")
     detection_cmd_topic = LaunchConfiguration("detection_cmd_topic")
     stop_cmd_topic = LaunchConfiguration("stop_cmd_topic")
     params_file = LaunchConfiguration("params_file")
@@ -62,19 +68,21 @@ def generate_launch_description():
     state_topic = LaunchConfiguration("state_topic")
 
     line_follower_node = Node(
-    package="line_follower",
-    executable="line_follower_node",
-    name="line_follower_node",
-    output="screen",
-    parameters=[
-        params_file,
-        {
-            "image_topic": image_topic,
-            "cmd_vel_topic": follower_cmd_topic,
-            "stop_cmd_topic": stop_cmd_topic,
-         },
-     ],
-   )
+        package="line_follower",
+        executable="line_follower_node",
+        name="line_follower_node",
+        output="screen",
+        parameters=[
+            params_file,
+            {
+                "image_topic": image_topic,
+                "cmd_vel_topic": follower_cmd_topic,
+                "avoid_cmd_topic": avoid_cmd_topic,
+                "detection_cmd_topic": detection_cmd_topic,
+                "stop_cmd_topic": stop_cmd_topic,
+            },
+        ],
+    )
 
     detection_turn_node = Node(
         package="line_follower",
@@ -91,6 +99,7 @@ def generate_launch_description():
         ],
     )
 
+    # 注意：不再在字典里硬编码 high_timeout / stop_timeout，完全以 params_file 为准
     mux_node = Node(
         package="line_follower",
         executable="cmd_mux_node",
@@ -100,9 +109,8 @@ def generate_launch_description():
             params_file,
             {
                 "stop_topic": stop_cmd_topic,
-                "stop_timeout": 0.5,
+                "avoid_topic": avoid_cmd_topic,
                 "high_topic": detection_cmd_topic,
-                "high_timeout": 0.5,
                 "low_topic": follower_cmd_topic,
                 "output_topic": cmd_vel_topic,
             },
@@ -113,6 +121,7 @@ def generate_launch_description():
         image_topic_arg,
         cmd_vel_topic_arg,
         follower_cmd_arg,
+        avoid_cmd_arg,
         detection_cmd_arg,
         stop_cmd_arg,
         params_arg,

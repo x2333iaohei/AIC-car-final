@@ -122,6 +122,66 @@ class CanvasTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Dashboard((960, 600), (2, 2))
 
+    def test_default_local_output_path_and_auto_increment(self):
+        import render
+        with tempfile.TemporaryDirectory() as temp:
+            orig_dir = render.DEFAULT_OUTPUT_DIR
+            try:
+                render.DEFAULT_OUTPUT_DIR = Path(temp)
+                bag_dir = Path(temp) / "my_run_bag"
+                bag_dir.mkdir()
+                out1, side1 = render.resolve_output_path(None, bag_dir, "focus")
+                self.assertEqual(out1, (Path(temp) / "my_run_bag_focus.mp4").resolve())
+                self.assertEqual(side1, (Path(temp) / "my_run_bag_focus_analysis").resolve())
+                out1.write_bytes(b"placeholder")
+                out2, side2 = render.resolve_output_path(None, bag_dir, "focus")
+                self.assertEqual(out2, (Path(temp) / "my_run_bag_focus_001.mp4").resolve())
+                self.assertEqual(side2, (Path(temp) / "my_run_bag_focus_001_analysis").resolve())
+            finally:
+                render.DEFAULT_OUTPUT_DIR = orig_dir
+
+    def test_recorded_debug_image_pairing_and_fallback(self):
+        raw_img = np.zeros((60, 110, 3), dtype=np.uint8)
+        raw_img[:, 20:80] = 255
+        dbg_img = np.full((60, 110, 3), (10, 200, 10), dtype=np.uint8)
+
+        class PairedBag:
+            seen = {
+                "/image_raw": "sensor_msgs/msg/Image",
+                "/line_follower/debug_image": "sensor_msgs/msg/Image",
+            }
+
+            def messages(self, wanted):
+                self.selected = wanted
+                t1 = 10 * Second
+                t2 = 10 * Second + 100_000_000
+                s1 = SimpleNamespace(sec=t1 // Second, nanosec=t1 % Second)
+                s2 = SimpleNamespace(sec=t2 // Second, nanosec=t2 % Second)
+                yield "/image_raw", t1, SimpleNamespace(
+                    encoding="bgr8", height=60, width=110, step=330,
+                    data=raw_img.reshape(-1), header=SimpleNamespace(stamp=s1))
+                # Debug image arrives 15ms later with identical header timestamp
+                yield "/line_follower/debug_image", t1 + 15_000_000, SimpleNamespace(
+                    encoding="bgr8", height=60, width=110, step=330,
+                    data=dbg_img.reshape(-1), header=SimpleNamespace(stamp=s1))
+                # Second frame has no matching debug_image -> falls back to reconstructed overlay
+                yield "/image_raw", t2, SimpleNamespace(
+                    encoding="bgr8", height=60, width=110, step=330,
+                    data=raw_img.reshape(-1), header=SimpleNamespace(stamp=s2))
+
+        with tempfile.TemporaryDirectory() as temp, Timeline() as db:
+            output = Path(temp)
+            args = parser().parse_args(["--bag", temp, "--params", "unused.yaml",
+                                        "--output", str(output / "out.mp4"),
+                                        "--resolution", "640x400", "--keyframes", "0"])
+            bag = PairedBag()
+            _, _, _, counts = render_frames(bag, db, args, StampClock(), TOPICS, parameters(),
+                                            args.output, output)
+            self.assertEqual(bag.selected, {"/image_raw", "/line_follower/debug_image"})
+            self.assertEqual(counts["frames_processed"], 2)
+            self.assertEqual(counts["recorded_debug_overlay_frames"], 1)
+            self.assertEqual(counts["reconstructed_debug_overlay_frames"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

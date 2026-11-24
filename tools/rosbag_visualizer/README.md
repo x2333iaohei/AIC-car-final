@@ -35,34 +35,27 @@ py -3 -m venv tools/rosbag_visualizer/.venv
 
 Windows 上执行下文的渲染命令时，将 `python3` 换成上述解释器路径，并把命令写在一行。读取器接口参考 [Humble rosbag2_py](https://index.ros.org/p/rosbag2_py/) 和 [Rosbags 存储支持](https://ternaris.gitlab.io/rosbags/topics/rosbag2.html)。
 
-## 运行
+## 运行（本地默认路径）
 
-准备 Bag 目录（或单个 `.db3` / `.mcap`）以及录制当时使用的巡线 YAML。优先使用随包保存的参数快照。若换用其他配置，画面反映的是该配置对同一录包的离线重建。
+本工具已适配本地目录 `E:\desktop\AIC\rosbag_visualizer`：
 
-### 日常回看
+- `--output` 可省略，默认自动保存到本地目录 `E:\desktop\AIC\rosbag_visualizer\output\<bag名>_<布局>.mp4`（同名时自动递增 `_001`、`_002`，不会覆盖历史结果）。
+- `--params` 可省略，默认自动读取本地 `E:\desktop\AIC\ws_rdkx5\src\line_follow_ws\src\line_follower\config\line_follower_params.yaml`；若使用其他 YAML，仍可通过 `--params` 指定。
+- **关于 `/line_follower/debug_image`**：
+  - 默认 `--overlay-source auto`：若 Bag 中录制了 `/line_follower/debug_image`，会自动按时间戳配对并在主叠加面板中直接显示车端调试图；
+  - 若 Bag 中**没有**录制 `/line_follower/debug_image`，会自动使用 `/image_raw` + 参数 YAML 离线重建完整带巡线算法叠加标记（ROI 融合、白路框、红点目标、分界线、红锥/红线风险标注、连续弯与黄线提示）的调试画面；
+  - 若想强制按新 YAML 离线重算叠加图，可加 `--overlay-source reconstructed`。
 
-默认重点视图适合看车辆什么时候识别黄线、是否降速，以及巡线目标有没有偏离道路。
+### 日常回看（Windows PowerShell 一行命令）
 
-```bash
-python3 tools/rosbag_visualizer/render.py \
-  --bag /path/to/rosbag \
-  --params /path/to/preset.yaml \
-  --layout focus \
-  --fps 15 \
-  --resolution 1280x800 \
-  --output analysis.mp4
+```powershell
+& E:\desktop\AIC\rosbag_visualizer\.venv\Scripts\python.exe E:\desktop\AIC\rosbag_visualizer\render.py --bag E:\desktop\AIC\<你的bag目录> --layout focus --fps 15 --resolution 1280x800
 ```
 
-### 排查某一步图像处理
+### 排查某一步图像处理（12 格详细视图）
 
-把同一份 Bag 另渲染成 12 格，可对照原图、ROI、各级 Mask、轮廓和选点结果。
-
-```bash
-python3 tools/rosbag_visualizer/render.py \
-  --bag /path/to/rosbag \
-  --params /path/to/preset.yaml \
-  --layout 3x4 \
-  --output analysis_detail.mp4
+```powershell
+& E:\desktop\AIC\rosbag_visualizer\.venv\Scripts\python.exe E:\desktop\AIC\rosbag_visualizer\render.py --bag E:\desktop\AIC\<你的bag目录> --layout 3x4
 ```
 
 默认自动识别 SQLite3/MCAP，并优先用 `rosbag2_py`。用 `--backend rosbags` 显式选择便携式读取器。用 `--storage sqlite3` 或 `--storage mcap` 指定原生存储。ROS 录制器的 file 压缩模式请用便携式后端或单独解压到一个副本再读。输出路径必须是新的 `.mp4`，避免覆盖已有分析结果。

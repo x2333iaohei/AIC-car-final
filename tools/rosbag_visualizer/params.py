@@ -26,6 +26,13 @@ DEFAULTS = {
     "reverse_curve_threshold": .35, "reverse_curve_confirm_frames": 3,
     "reverse_curve_clear_frames": 4, "enable_curve_preview_steering": False,
     "curve_preview_max_far_weight": .45,
+    "enable_red_zone_cluster": False, "red_zone_close_kernel_w": 35,
+    "red_zone_close_kernel_h": 13, "red_zone_min_width_ratio": .11,
+    "red_zone_min_area_ratio": .0030, "red_zone_max_fill_ratio": .30,
+    "red_zone_near_ratio": .28,
+    "enable_tjunction_merge": False, "tjunction_wall_min_y_ratio": .23,
+    "tjunction_wall_max_y_ratio": .62, "tjunction_wall_max_spread_ratio": .10,
+    "tjunction_min_full_rows": 55,
 }
 
 

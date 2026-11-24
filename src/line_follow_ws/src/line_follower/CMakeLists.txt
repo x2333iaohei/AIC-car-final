@@ -59,6 +59,7 @@ ament_target_dependencies(detection_turn_controller
   rclcpp
   ai_msgs
   geometry_msgs
+  std_msgs
 )
 
 add_executable(cmd_mux_node src/cmd_mux_node.cpp)

@@ -26,6 +26,18 @@ TOPICS = {
     "state": "/line_follower/track_state", "start": "/line_follower/start_cmd",
     "centroid": "/line_follower/centroid", "log": "/rosout",
 }
+DEFAULT_DEBUG_IMAGE_TOPIC = "/line_follower/debug_image"
+LOCAL_DIR = Path(__file__).resolve().parent
+DEFAULT_OUTPUT_DIR = LOCAL_DIR / "output"
+DEFAULT_LOCAL_PARAMS = (
+    LOCAL_DIR.parents[1]
+    / "src"
+    / "line_follow_ws"
+    / "src"
+    / "line_follower"
+    / "config"
+    / "line_follower_params.yaml"
+)
 
 FRAME_FIELDS = (
     "frame", "segment", "time_ns", "bag_time_ns", "image_clock", "relative_s", "source_fps",
@@ -70,11 +82,48 @@ def bounded_number(low, high):
     return parse
 
 
+def resolve_params_path(explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit
+    if DEFAULT_LOCAL_PARAMS.is_file():
+        return DEFAULT_LOCAL_PARAMS
+    raise ValueError(
+        "Missing --params YAML and default local config not found at "
+        f"{DEFAULT_LOCAL_PARAMS}"
+    )
+
+
+def resolve_output_path(explicit: Path | None, bag_path: Path, layout):
+    if explicit is not None:
+        if explicit.suffix.lower() != ".mp4":
+            raise ValueError("--output must end in .mp4")
+        output = explicit.resolve()
+        sidecars = output.with_name(output.stem+"_analysis")
+        if output.exists() or sidecars.exists():
+            raise FileExistsError("Choose a new output path; the MP4 or analysis folder exists.")
+        return output, sidecars
+    bag_name = bag_path.stem if bag_path.is_file() else bag_path.name
+    bag_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in bag_name).strip("._") or "rosbag"
+    layout_tag = "focus" if layout == "focus" else f"{layout[0]}x{layout[1]}"
+    stem = f"{bag_name}_{layout_tag}"
+    candidate = (DEFAULT_OUTPUT_DIR / f"{stem}.mp4").resolve()
+    sidecars = candidate.with_name(candidate.stem+"_analysis")
+    index = 1
+    while candidate.exists() or sidecars.exists():
+        candidate = (DEFAULT_OUTPUT_DIR / f"{stem}_{index:03d}.mp4").resolve()
+        sidecars = candidate.with_name(candidate.stem+"_analysis")
+        index += 1
+    return candidate, sidecars
+
+
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--bag", required=True, type=Path)
-    cli.add_argument("--params", required=True, type=Path)
-    cli.add_argument("--output", required=True, type=Path, help="MP4 path; sidecars in <stem>_analysis")
+    cli.add_argument("--params", type=Path, default=None,
+                     help=f"ROS parameter YAML (default: {DEFAULT_LOCAL_PARAMS})")
+    cli.add_argument("--output", type=Path, default=None,
+                     help=f"MP4 path (default: {DEFAULT_OUTPUT_DIR}\\<bag>_<layout>.mp4); "
+                          "sidecars in <stem>_analysis")
     cli.add_argument("--layout", type=parse_layout, default="focus",
                      help="focus (default), or rows x columns for detailed panels")
     cli.add_argument("--resolution", type=dimensions, default=(1280, 800), help="Width x height")
@@ -91,13 +140,17 @@ def parser():
     cli.add_argument("--stop-yaw", type=bounded_number(.001, 2.), default=.05)
     cli.add_argument("--stop-dwell", type=bounded_number(.01, 3.), default=.20)
     cli.add_argument("--keyframes", type=int, default=48, help="Maximum annotated PNGs; 0 disables")
+    cli.add_argument("--debug-image-topic", default=DEFAULT_DEBUG_IMAGE_TOPIC,
+                     help="Optional recorded debug image topic; offline overlay is reconstructed when absent")
+    cli.add_argument("--overlay-source", choices=("auto", "reconstructed", "recorded"), default="auto",
+                     help="auto uses recorded debug_image when present and falls back to full offline overlay")
     for role, topic in TOPICS.items():
         cli.add_argument(f"--{role}-topic", default=topic)
     return cli
 
 
 def index_telemetry(bag, db, args, clock, topics):
-    inputs = {topic: role for role, topic in topics.items() if role != "image"}
+    inputs = {topic: role for role, topic in topics.items() if role not in ("image", "debug_image")}
     counts = Counter()
     for topic, record, msg in bag.messages(set(inputs)):
         role = inputs[topic]
@@ -114,11 +167,19 @@ def index_telemetry(bag, db, args, clock, topics):
         ns, source = clock.choose(record, header_ns(msg))
         db.add(role, ns, value, source)
         counts[role] += 1
-        if role == "log" and value[0] == "yellow_trigger":
-            db.add("yellow_log", ns, value, source)
+        if role == "log":
+            if value[0] == "yellow_trigger":
+                db.add("yellow_log", ns, value, source)
+            elif topics["start"] not in bag.seen and value[0] in ("start_true", "start_false", "start_waiting"):
+                db.add("start", ns, (value[0] == "start_true",), source)
         if sum(counts.values()) % 10000 == 0:
             db.flush()
     db.flush()
+    if topics["start"] not in bag.seen and not db.has("start") and db.has("state"):
+        first_state = next(db.range("state"), None)
+        if first_state is not None:
+            db.add("start", first_state.ns, (True,), first_state.clock)
+            db.flush()
     return counts
 
 
@@ -195,12 +256,150 @@ def render_frames(bag, db, args, clock, topics, params, video, results):
     force_segment = False
     last_candidate_ns = None
     previously_yellow = False
+
+    image_topic = topics["image"]
+    debug_topic = topics.get("debug_image") or getattr(args, "debug_image_topic", DEFAULT_DEBUG_IMAGE_TOPIC)
+    overlay_source = getattr(args, "overlay_source", "auto")
+    debug_only_fallback = image_topic not in bag.seen and debug_topic in bag.seen
+    if debug_only_fallback:
+        image_topic = debug_topic
+        use_recorded_debug = False
+    else:
+        use_recorded_debug = (
+            overlay_source != "reconstructed"
+            and debug_topic in bag.seen
+            and debug_topic != image_topic
+        )
+
+    def process_frame(ns, receipt, source, image, recorded_debug):
+        nonlocal origin, previous, minimum, maximum, segment, force_segment
+        nonlocal last_candidate_ns, previously_yellow
+        if ns == previous:
+            counts["duplicate_image_stamp_skipped"] += 1
+            return
+        delta = None if previous is None else ns-previous
+        new_segment = delta is None or delta < 0 or delta > gap_ns or force_segment
+        if new_segment:
+            segment += 1
+            origin = ns if origin is None else origin
+            vision.reset()
+            latch.reset()
+            red_history.reset()
+            last_candidate_ns = None
+            previously_yellow = False
+            started = db.latest("start", ns)
+            if started:
+                latch.start(started.value[0])
+            if segment > 1:
+                why = ("image_decode_error" if force_segment else
+                       "backward_image_stamp" if delta < 0 else "long_image_gap")
+                db.add("replay", ns, ("image_segment_reset", None, None, why), source)
+                counts[why] += 1
+        else:
+            for switch in db.range("start", previous+1, ns):
+                if latch.start(switch.value[0]):
+                    red_history.reset()
+                if not switch.value[0]:
+                    vision.reset()
+
+        current = vision.process(image, latch.started)
+        events = latch.update(ns, current.yellow_detected)
+        red_history.update(current, latch.started, latch.stopping(ns))
+        transition = any(kind == "yellow_pixel_trigger" for kind, _, _ in events)
+        mask_rising = current.yellow_detected and not previously_yellow
+        previously_yellow = current.yellow_detected
+        if mask_rising and not transition:
+            events.append(("yellow_mask_rising", None, None))
+        for kind, count, total in events:
+            db.add("replay", ns, (kind, count, total, f"segment {segment}"), source)
+            counts[kind] += 1
+        counts["frames_processed"] += 1
+        if recorded_debug is not None:
+            counts["recorded_debug_overlay_frames"] += 1
+        else:
+            counts["reconstructed_debug_overlay_frames"] += 1
+        if latch.started is None:
+            counts["frames_start_unknown"] += 1
+        number = counts["frames_processed"]
+        row = frame_data(db, ns, origin, segment, number, receipt, source,
+                         None if new_segment else Second/delta, current, latch, age, image.shape)
+        frames.writerow(row)
+        log = db.latest("yellow_log", ns, 600_000_000)
+        recorded_event = log and (new_segment or log.ns > previous) and ns-log.ns <= gap_ns
+        if transition or mask_rising:
+            last_candidate_ns = ns
+        if log:
+            point = f"RECORDED yellow {log.value[1]}/{log.value[2]} ({(ns-log.ns)/Second:.2f}s ago)"
+        elif last_candidate_ns is not None and ns-last_candidate_ns <= 600_000_000:
+            point = "RECONSTRUCTED yellow observation"
+        else:
+            point = ""
+        rendered = None
+
+        def canvas():
+            nonlocal rendered
+            if rendered is None:
+                if focused:
+                    rendered = panel.compose(image, current, params, row, point, recorded_debug=recorded_debug)
+                else:
+                    rendered = panel.compose(image, current, params, footer(row, current, point),
+                                             recorded_debug=recorded_debug)
+            return rendered
+
+        cfr.push(ns, canvas, new_segment)
+        if ((new_segment or transition or mask_rising or recorded_event) and
+                counts["keyframes"] < args.keyframes):
+            tag = "recorded_yellow" if recorded_event else (
+                "vision_yellow" if transition else "segment")
+            image_path = keydir / f"{number:08}_{tag}.png"
+            if not cv2.imwrite(str(image_path), canvas()):
+                raise OSError(f"Cannot write {image_path}")
+            counts["keyframes"] += 1
+        previous, force_segment = ns, False
+        minimum = ns if minimum is None else min(minimum, ns)
+        maximum = ns if maximum is None else max(maximum, ns)
+
     try:
         with (results / "frames.csv").open("w", newline="", encoding="utf-8") as stream:
             frames = csv.DictWriter(stream, FRAME_FIELDS)
             frames.writeheader()
-            for _, receipt, msg in bag.messages({topics["image"]}):
+            wanted = {image_topic, debug_topic} if use_recorded_debug else {image_topic}
+            pending = None
+            last_debug = None
+
+            def flush_pending():
+                nonlocal pending, last_debug
+                if pending is None:
+                    return
+                p_ns, p_receipt, p_source, p_image = pending
+                matched = None
+                if last_debug is not None and abs(p_ns - last_debug[0]) <= age:
+                    matched = last_debug[1]
+                    last_debug = None
+                process_frame(p_ns, p_receipt, p_source, p_image, matched)
+                pending = None
+
+            for topic, receipt, msg in bag.messages(wanted):
+                if use_recorded_debug and topic == debug_topic:
+                    counts["debug_images_seen"] += 1
+                    try:
+                        dbg_image = decode_image(msg)
+                    except (cv2.error, ValueError, TypeError, AttributeError):
+                        counts["debug_image_decode_failed"] += 1
+                        continue
+                    dbg_ns, _ = clock.choose(receipt, header_ns(msg))
+                    if pending is not None and abs(dbg_ns - pending[0]) <= age:
+                        p_ns, p_receipt, p_source, p_image = pending
+                        pending = None
+                        last_debug = None
+                        process_frame(p_ns, p_receipt, p_source, p_image, dbg_image)
+                    else:
+                        last_debug = (dbg_ns, dbg_image)
+                    continue
+
                 counts["images_seen"] += 1
+                if use_recorded_debug:
+                    flush_pending()
                 try:
                     image = decode_image(msg)
                 except (cv2.error, ValueError, TypeError, AttributeError):
@@ -209,89 +408,23 @@ def render_frames(bag, db, args, clock, topics, params, video, results):
                     continue
                 ns, source = clock.choose(receipt, header_ns(msg))
                 counts[f"image_{source}_stamp"] += 1
-                if ns == previous:
-                    counts["duplicate_image_stamp_skipped"] += 1
-                    continue
-                delta = None if previous is None else ns-previous
-                new_segment = delta is None or delta < 0 or delta > gap_ns or force_segment
-                if new_segment:
-                    segment += 1
-                    origin = ns if origin is None else origin
-                    vision.reset()
-                    latch.reset()
-                    red_history.reset()
-                    last_candidate_ns = None
-                    previously_yellow = False
-                    started = db.latest("start", ns)
-                    if started:
-                        latch.start(started.value[0])
-                    if segment > 1:
-                        why = ("image_decode_error" if force_segment else
-                               "backward_image_stamp" if delta < 0 else "long_image_gap")
-                        db.add("replay", ns, ("image_segment_reset", None, None, why), source)
-                        counts[why] += 1
+                if debug_only_fallback:
+                    process_frame(ns, receipt, source, image, image)
+                elif use_recorded_debug:
+                    if last_debug is not None and ns == last_debug[0]:
+                        matched = last_debug[1]
+                        last_debug = None
+                        process_frame(ns, receipt, source, image, matched)
+                    else:
+                        pending = (ns, receipt, source, image)
                 else:
-                    for switch in db.range("start", previous+1, ns):
-                        if latch.start(switch.value[0]):
-                            red_history.reset()
-                        if not switch.value[0]:
-                            vision.reset()
-
-                current = vision.process(image, latch.started)
-                events = latch.update(ns, current.yellow_detected)
-                red_history.update(current, latch.started, latch.stopping(ns))
-                transition = any(kind == "yellow_pixel_trigger" for kind, _, _ in events)
-                mask_rising = current.yellow_detected and not previously_yellow
-                previously_yellow = current.yellow_detected
-                if mask_rising and not transition:
-                    events.append(("yellow_mask_rising", None, None))
-                for kind, count, total in events:
-                    db.add("replay", ns, (kind, count, total, f"segment {segment}"), source)
-                    counts[kind] += 1
-                counts["frames_processed"] += 1
-                if latch.started is None:
-                    counts["frames_start_unknown"] += 1
-                number = counts["frames_processed"]
-                row = frame_data(db, ns, origin, segment, number, receipt, source,
-                                 None if new_segment else Second/delta, current, latch, age, image.shape)
-                frames.writerow(row)
-                log = db.latest("yellow_log", ns, 600_000_000)
-                recorded_event = log and (new_segment or log.ns > previous) and ns-log.ns <= gap_ns
-                if transition or mask_rising:
-                    last_candidate_ns = ns
-                if log:
-                    point = f"RECORDED yellow {log.value[1]}/{log.value[2]} ({(ns-log.ns)/Second:.2f}s ago)"
-                elif last_candidate_ns is not None and ns-last_candidate_ns <= 600_000_000:
-                    point = "RECONSTRUCTED yellow observation"
-                else:
-                    point = ""
-                rendered = None
-
-                def canvas():
-                    nonlocal rendered
-                    if rendered is None:
-                        if focused:
-                            rendered = panel.compose(image, current, params, row, point)
-                        else:
-                            rendered = panel.compose(image, current, params, footer(row, current, point))
-                    return rendered
-
-                cfr.push(ns, canvas, new_segment)
-                if ((new_segment or transition or mask_rising or recorded_event) and
-                        counts["keyframes"] < args.keyframes):
-                    tag = "recorded_yellow" if recorded_event else (
-                        "vision_yellow" if transition else "segment")
-                    image_path = keydir / f"{number:08}_{tag}.png"
-                    if not cv2.imwrite(str(image_path), canvas()):
-                        raise OSError(f"Cannot write {image_path}")
-                    counts["keyframes"] += 1
-                previous, force_segment = ns, False
-                minimum = ns if minimum is None else min(minimum, ns)
-                maximum = ns if maximum is None else max(maximum, ns)
+                    process_frame(ns, receipt, source, image, None)
+            if use_recorded_debug:
+                flush_pending()
     finally:
         writer.release()
     if origin is None:
-        raise ValueError(f"No decodable images on {topics['image']}; available: {', '.join(bag.seen)}")
+        raise ValueError(f"No decodable images on {image_topic}; available: {', '.join(bag.seen)}")
     if not video.is_file() or video.stat().st_size == 0:
         raise OSError("MP4 encoder produced no output")
     counts.update(output_frames=cfr.count, held_output_frames=cfr.duplicates, segments=segment)
@@ -355,24 +488,35 @@ def export_speed(db, results, origin):
             writer.writerow((ns, (ns-origin)/Second, role, s.clock, *s.value))
 
 
-def report(args, bag, topics, recorded, images, brake_status, results, origin):
+def report(args, bag, topics, recorded, images, brake_status, results, origin, params_path):
     layout = ("focus view" if args.layout == "focus"
               else f"{args.layout[0]} x {args.layout[1]} tiles")
     lines = [
         "# Offline ROS 2 bag analysis", "",
         f"- Input: `{args.bag.name}` ({bag.storage}, {bag.backend})",
-        f"- Parameter YAML: `{args.params.name}` for `{args.node}` "
-        f"(SHA-256 `{hashlib.sha256(args.params.read_bytes()).hexdigest()}`)",
+        f"- Parameter YAML: `{params_path.name}` for `{args.node}` "
+        f"(SHA-256 `{hashlib.sha256(params_path.read_bytes()).hexdigest()}`)",
         f"- OpenCV: {cv2.__version__}",
         f"- Video: {layout}, {args.fps:g} FPS, "
         f"{args.resolution[0]} x {args.resolution[1]}",
+        f"- Overlay mode: `{args.overlay_source}` "
+        f"(recorded debug_image frames: {images.get('recorded_debug_overlay_frames', 0)}, "
+        f"reconstructed overlay frames: {images.get('reconstructed_debug_overlay_frames', 0)})",
         f"- Timeline origin: `{origin}` ns. Policy: {args.clock}, maximum header skew "
         f"{args.max_header_skew:g} s. Speed/centroid as-of limit: {args.sync_max_age:g} s.", "",
         "| Role | Topic | Recorded type | Indexed samples |", "|---|---|---|---:|",
     ]
     for role, topic in topics.items():
-        count = images["images_seen"] if role == "image" else recorded[role]
-        lines.append(f"| {role} | `{topic}` | {bag.seen.get(topic, 'missing')} | {count} |")
+        if role == "image":
+            count = images["images_seen"]
+            recorded_type = bag.seen.get(topic, "missing")
+        elif role == "debug_image":
+            count = images.get("debug_images_seen", 0)
+            recorded_type = bag.seen.get(topic, "missing (offline overlay reconstructed)")
+        else:
+            count = recorded[role]
+            recorded_type = bag.seen.get(topic, "missing")
+        lines.append(f"| {role} | `{topic}` | {recorded_type} | {count} |")
     lines += ["", "The log count only includes recognized events from the selected follower logger.",
               "", "## Coverage", ""]
     for values in (images, brake_status):
@@ -410,16 +554,13 @@ def report(args, bag, topics, recorded, images, brake_status, results, origin):
 def run(args):
     if args.keyframes < 0:
         raise ValueError("--keyframes must be nonnegative")
-    if args.output.suffix.lower() != ".mp4":
-        raise ValueError("--output must end in .mp4")
-    output = args.output.resolve()
-    sidecars = output.with_name(output.stem+"_analysis")
-    if output.exists() or sidecars.exists():
-        raise FileExistsError("Choose a new output path; the MP4 or analysis folder exists.")
+    params_path = resolve_params_path(args.params)
+    output, sidecars = resolve_output_path(args.output, args.bag.resolve(), args.layout)
     topics = {role: getattr(args, role+"_topic") for role in TOPICS}
     if len(set(topics.values())) != len(topics):
         raise ValueError("Each stream requires a distinct topic")
-    params = load_params(args.params, args.node)
+    topics["debug_image"] = args.debug_image_topic
+    params = load_params(params_path, args.node)
     bag = Bag(args.bag, args.storage, args.backend)
     clock = StampClock(args.clock, args.max_header_skew)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -435,7 +576,7 @@ def run(args):
         export_speed(db, staged_results, origin)
         speed_chart(db, staged_results / "speed.png", minimum, maximum,
                     int(args.sync_max_age*Second))
-        report(args, bag, topics, recorded, frames, brake_status, staged_results, origin)
+        report(args, bag, topics, recorded, frames, brake_status, staged_results, origin, params_path)
         staged_results.rename(sidecars)
         staged_video.rename(output)
     print(f"{frames['frames_processed']} source frames, {frames['output_frames']} video frames")
